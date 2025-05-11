@@ -1,0 +1,93 @@
+import time
+import pytest
+from types import SimpleNamespace
+
+# Adjust imports to match your project structure:
+from src.mypackage.get_top_players import get_top_players, REQUEST_DELAY
+from src.mypackage.player_init import Goalkeeper, Defender, Midfielder, Attacker
+
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    """Prevent real sleeping during tests."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+@pytest.fixture
+def fake_player_ids(monkeypatch):
+    """Make get_players_ids return a fixed list of IDs."""
+    fake_ids = [1, 2, 3, 4, 5, 6]
+    monkeypatch.setattr(
+        "yourpackage.get_top_players.get_players_ids",
+        lambda country, season: fake_ids
+    )
+    return fake_ids
+
+class DummyPlayer(SimpleNamespace):
+    """A SimpleNamespace with compute_rating method."""
+    def compute_rating(self):
+        return self.rating
+
+@pytest.fixture
+def fake_players(monkeypatch):
+    """
+    Monkeypatch Player.from_api so that:
+    - IDs 1–3 yield Goalkeepers with ratings 10, 5, 7
+    - IDs 4–6 yield Defenders/Midfielders/Attackers with varied ratings
+    """
+    def fake_from_api(cls, pid, season):
+        mapping = {
+            1: (Goalkeeper, 10),
+            2: (Goalkeeper, 5),
+            3: (Goalkeeper, 7),
+            4: (Defender,   8),
+            5: (Midfielder, 9),
+            6: (Attacker,   6),
+        }
+        PosClass, rating = mapping[pid]
+        # return an instance of PosClass with rating field
+        inst = DummyPlayer()
+        inst.__class__ = PosClass
+        inst.rating = rating
+        return inst
+
+    monkeypatch.setattr(
+        "yourpackage.get_top_players.Player.from_api",
+        classmethod(fake_from_api)
+    )
+
+def test_grouping_and_counts(fake_player_ids, fake_players):
+    top = get_top_players("Spain", "2023")
+
+    # Goalkeeper group: we had three goalkeepers, sorted by rating -> [10,7,5]
+    gk_ratings = [p.compute_rating() for p in top["Goalkeeper"]]
+    assert gk_ratings == [10, 7, 5]
+
+    # Defender: only one (ID 4), so top 8 picks that one
+    assert len(top["Defender"]) == 1
+    assert isinstance(top["Defender"][0], Defender)
+    assert top["Defender"][0].compute_rating() == 8
+
+    # Midfielder: only one (ID 5)
+    assert len(top["Midfielder"]) == 1
+    assert isinstance(top["Midfielder"][0], Midfielder)
+    assert top["Midfielder"][0].compute_rating() == 9
+
+    # Attacker: only one (ID 6)
+    assert len(top["Attacker"]) == 1
+    assert isinstance(top["Attacker"][0], Attacker)
+    assert top["Attacker"][0].compute_rating() == 6
+
+def test_rate_limiting(fake_player_ids, fake_players, monkeypatch):
+    """
+    Ensure that get_top_players sleeps between API calls.
+    Since we patched time.sleep to a no-op, we can count invocations.
+    """
+    calls = []
+    monkeypatch.setattr(time, "sleep", lambda s: calls.append(s))
+
+    # call function
+    get_top_players("Spain", "2023")
+
+    # We have 6 player_ids, so sleep should be called 5 times (after the first)
+    assert len(calls) == len(fake_player_ids) - 1
+    # Each sleep should be the REQUEST_DELAY constant
+    assert all(s == REQUEST_DELAY for s in calls)
