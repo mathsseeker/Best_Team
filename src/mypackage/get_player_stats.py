@@ -1,62 +1,121 @@
 import pandas as pd
 import requests
 from typing import Optional, Dict
+import os
+import hashlib
+import json
+from pathlib import Path
 
-KEY = "82c2ff00a706bf9dd19cdd152fd01aeb"
+
+# For privacy purposes, the API key is not hardcoded.
+def load_env_file(filepath: str):
+    """Load environment variables from a file."""
+    try:
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                key, value = line.split('=', 1)
+                os.environ[key.strip()] = value.strip()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Could not find .env file at {filepath}")
+
+# Get the path to the .env file in the project root
+current_dir = Path(__file__).parent
+project_root = current_dir.parent.parent 
+env_path = project_root / '.env'
+
+
+load_env_file(str(env_path))
+
+# Get the API key
+KEY = os.getenv('API_KEY')
 URL = "https://v3.football.api-sports.io/"
 
-def call_api(endpoint: str, params: Optional[Dict[str, str]] = None) -> pd.DataFrame:
-    """
-    Makes a GET request to the specified API endpoint with optional query parameters.
-    
-    Args:
-        endpoint (str): The API endpoint to call (e.g., "players").
-        params (Optional[Dict[str, str]]): A dictionary of query parameters to include in the request.
+# Create a cache directory
+CACHE_DIR = project_root / "api_cache"
+CACHE_DIR.mkdir(exist_ok=True)
 
-    Returns:
-        pd.DataFrame: A Pandas DataFrame containing the flattened API response data.
+def get_cache_filename(endpoint: str, params: Dict[str, str]) -> Path:
+    """Generate a unique filename for caching based on endpoint and parameters."""
+    param_str = json.dumps(params, sort_keys=True) if params else "no_params"
+    unique_key = f"{endpoint}_{param_str}"
+    filename = hashlib.md5(unique_key.encode()).hexdigest() + ".json"
+    return CACHE_DIR / filename
 
-    Raises:
-        Exception: If the API request fails or the response contains no data.
-    """
+def load_from_cache(cache_file: Path) -> Optional[Dict]:
+    """Load data from cache file if it exists."""
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Cache file corrupted, deleting {cache_file}")
+            cache_file.unlink()  # Remove corrupted cache file if it exists
+            return None
+    return None
 
-    params = params or {}
-    headers = {"x-rapidapi-key": KEY}
-    url = f"{URL}{endpoint}"
-    
+def save_to_cache(cache_file: Path, data: Dict):
+    """Save API response data to cache file."""
     try:
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status() # Raises an error for bad responses
-        data = response.json()
+        with open(cache_file, 'w') as f:
+            json.dump(data, f)
+    except IOError as e:
+        print(f"Warning: Could not save cache file {cache_file}: {e}")
+
+
+
+def call_api(endpoint: str, params: Optional[Dict[str, str]] = None) -> pd.DataFrame:
+    """Makes a GET request to the specified API endpoint with optional query parameters.
+    Uses local cache to avoid repeated calls for the same data."""
+    params = params or {}
+    cache_file = get_cache_filename(endpoint, params)
+    
+    # Try to load from cache first
+    cached_data = load_from_cache(cache_file)
+    if cached_data is not None:
+        data = cached_data
+    else:
+        # Not in cache, make API call
+        headers = {"x-rapidapi-key": KEY}
+        url = f"{URL}{endpoint}"
         
-        if not data.get("response"):
-            raise ValueError("No data found in the API response.")
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
             
-        # Normalize the main response
+            if not data.get("response"):
+                raise ValueError("No data found in the API response.")
+            
+            # Save to cache for future use
+            save_to_cache(cache_file, data)
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"API request failed: {str(e)}")
+        except ValueError as ve:
+            raise Exception(f"Value Error: {str(ve)}")
+    
+    # Process the data into a DataFrame
+    try:
         df = pd.json_normalize(data["response"], sep="_")
         
-        # If statistics exist, process them
         if "statistics" in df.columns:
-            # Reset index before exploding to avoid index issues
             df = df.reset_index(drop=True)
-            
-            # Explode statistics (each player might have multiple entries)
             df = df.explode("statistics", ignore_index=True)
             
-            # Normalize statistics
             stats_df = pd.json_normalize(
                 df["statistics"],
                 sep="_",
                 meta_prefix="statistics_"
             ).reset_index(drop=True)
             
-            # Merge with player data
             df = pd.concat([
                 df.drop("statistics", axis=1).reset_index(drop=True), 
                 stats_df
             ], axis=1)
             
-            # Flatten remaining nested columns
             for col in df.columns:
                 if df[col].notna().any() and isinstance(df[col].iloc[0], dict):
                     nested_df = pd.json_normalize(df[col], sep="_").add_prefix(f"{col}_")
@@ -67,13 +126,8 @@ def call_api(endpoint: str, params: Optional[Dict[str, str]] = None) -> pd.DataF
         
         return df
     
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"API request failed: {str(e)}")
-    except ValueError as ve:
-        raise Exception (f"Valure Error : {str(ve)}")
     except Exception as e:
         raise Exception(f"Error processing API response: {str(e)}")
-
 
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -88,7 +142,7 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     # Step 1: Remove prefixes carefully
     df.columns = df.columns.str.replace(r'^(statistics_|games_)', '', regex=True)  # Only remove unnecessary prefixes
     
-    # Step 2: Explicitly rename key columns (no guessing!)
+    # Step 2: Explicitly rename the columns
     column_renames = {
         # Player
         'player_id': 'player_id',
@@ -123,7 +177,14 @@ def get_player_stats(player_id: str, season: str) -> pd.DataFrame:
     params = {"id": player_id, "season": season}
     df = call_api("players", params)
     df = clean_column_names(df)
-
-    print("\nPlayer Statistics:")
-    print(df.to_string(index=False))  # Print without DataFrame index
     return df
+
+if __name__ == "__main__":
+    # Example usage
+    player_id = "154"  # Replace with actual player ID
+    season = "2022"  # Replace with actual season
+    try:
+        stats_df = get_player_stats(player_id, season)
+        print(stats_df.iloc[0])
+    except Exception as e:
+        print(f"An error occurred: {e}")
