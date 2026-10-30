@@ -1,7 +1,10 @@
 # Best Team Project
 
-Selecting the best possible Spanish national football team by scoring
-and ranking players from live match statistics.
+Automated selection of the best possible Spanish national football
+team: live player stats from a football API are scored with a
+weighted-metrics + Random Forest pipeline (SMOTE for class
+imbalance), and the top-ranked player is picked for each position to
+assemble the optimal starting eleven.
 
 ## What it does
 
